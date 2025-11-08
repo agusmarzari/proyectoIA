@@ -1,0 +1,70 @@
+# Flujo del Proyecto Integrador de Inteligencia Artificial
+
+## 1. Datos utilizados
+El sistema trabaja con dos fuentes de información: **imágenes** y **audios**.  
+Las imágenes están organizadas en una sola carpeta `dataset_mix/` que contiene fotos de diferentes tipos de piezas (tornillos, clavos, arandelas, tuercas).  
+Los audios corresponden a comandos de voz (“contar”, “proporción”, “salir”) utilizados para controlar la interacción.
+
+---
+
+## 2. Extracción de características (features) de las imágenes
+Cada imagen se transforma en un vector numérico que resume su forma, textura y color:
+
+- **Hu moments (7):** describen la forma general del objeto, invariantes a rotación y escala.  
+- **LBP uniform (10):** mide la textura local de la imagen en escala de grises.  
+- **Histograma HSV (512):** captura la distribución de colores en el espacio HSV.
+
+Resultado final: **vector de características de 529 elementos por imagen.**
+
+---
+
+## 3. Entrenamiento del modelo de visión (K-Means)
+Se aplica un preprocesamiento (estandarización, y opcionalmente PCA) y se entrena un modelo **K-Means** para agrupar las imágenes en clusters.  
+Luego se define un *mapping* entre cada cluster y la clase real (tornillo, clavo, etc.).  
+El modelo se guarda en `kmeans_piezas.joblib`.
+
+---
+
+## 4. Entrenamiento del modelo de voz (KNN)
+De los audios grabados se extraen características acústicas (MFCC, deltas, centroides espectrales, rolloff y ZCR).  
+Con esos vectores se entrena un modelo **KNN** que asocia cada grabación con un comando.  
+El modelo se guarda en `knn_voice.joblib`.
+
+---
+
+## 5. Funcionamiento de la GUI (`agent_main_random.py`)
+La interfaz creada con **PySimpleGUI** permite interactuar con los modelos:
+
+- **Botón “Ejecutar”:** selecciona 10 imágenes aleatorias del dataset, las clasifica con K-Means y muestra el conteo de piezas por clase.  
+- **Botón “Escuchar (mic)”:** graba la voz del usuario, clasifica el comando (contar, proporción o salir) y ejecuta la acción correspondiente.  
+- **Botón “Elegir WAV…”:** permite usar un archivo de audio en lugar del micrófono.  
+- **Archivo `sample_counts.json`:** guarda los conteos de piezas de la última ejecución.
+
+---
+
+## 6. Inferencia bayesiana
+Cuando se usa el comando “proporción”, se aplica un **modelo bayesiano** que calcula la probabilidad de que la muestra pertenezca a cada tipo de caja (A, B, C, D) según los conteos de piezas.  
+Se muestran las proporciones esperadas y la caja más probable (MAP).
+
+---
+
+## 7. Flujo completo del sistema
+1. El usuario toma o selecciona fotos y las coloca en `dataset_mix/`  
+2. El modelo K-Means agrupa las piezas en clases según sus características.  
+3. La GUI selecciona una muestra de 10 piezas, obtiene los conteos y los muestra.  
+4. El usuario emite comandos de voz o audio para solicitar acciones (contar, proporción o salir).  
+5. El sistema procesa el comando con el modelo KNN y responde según corresponda.
+
+---
+
+## 8. Demostración típica
+1. Cargar los modelos `kmeans_piezas.joblib` y `knn_voice.joblib`.  
+2. Ejecutar **“Elegir 10 al azar”**.  
+3. Decir **“proporción”** y mostrar los resultados bayesianos.  
+4. Finalizar con el comando **“salir”**.
+
+---
+
+## 9. Justificación del enfoque
+Este flujo mantiene coherencia entre el entrenamiento y la inferencia, garantizando que las características que ve el K-Means sean las mismas usadas en la clasificación en tiempo real.  
+Esto explica la alta precisión cuando se usó el mismo pipeline de features para todo el sistema.

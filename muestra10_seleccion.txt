@@ -1,0 +1,10 @@
+dataset_mix\IMG_5934.jpg
+dataset_mix\IMG_5944.jpg
+dataset_mix\IMG_5935.jpg
+dataset_mix\IMG_5938.jpg
+dataset_mix\IMG_5936.jpg
+dataset_mix\IMG_5948.jpg
+dataset_mix\IMG_5953.jpg
+dataset_mix\IMG_5942.jpg
+dataset_mix\IMG_5958.jpg
+dataset_mix\IMG_5943.jpg
