@@ -116,57 +116,119 @@ def extract_features_image_original(path):
 # ================== Extractor ROBUSTO (fotos nuevas) ============
 def extract_features_image_robust(path):
     """
-    Robusto para fotos del celu (sin reentrenar):
-      - Gray-World + auto-gamma
-      - Contraste (alpha=1.4, beta=20)
-      - Máscara HSV + morfología
-      - Recorte por contorno principal
-      - Hu (con máscara), LBP y HSV en región del objeto
+    Extracción ULTRA-robusta para fotos nuevas (fondo gris/azulado, luz desigual).
+    Combina:
+      - Balance de blancos + gamma
+      - CLAHE (mejora contraste local)
+      - Umbral mixto: Otsu en gris  ∪  Adaptativo en V (HSV)
+      - Filtro por baja saturación (metales ≈ gris: S baja)
+      - Morfología, limpieza de blobs chicos, recorte al contorno mayor
+      - Features: Hu (con máscara), LBP (gris), HSV dentro de máscara
+    Devuelve 529 dims (7 Hu + 10 LBP + 512 HSV), igual que el bundle.
     """
+    import cv2, numpy as np
+    from skimage.feature import local_binary_pattern
+
     img = cv2.imread(path)
     if img is None:
         raise ValueError(f"No se pudo leer {path}")
 
+    # --- 1) normalización de color/iluminación ---
     img = _gray_world_balance(img)
     img = _auto_gamma(img, target_mean=0.6)
 
-    # trabajar grande para segmentar
-    img = cv2.resize(img, (512,512))
-    mask = _make_mask_hsv(img)
-    crop, c = _largest_contour_crop(img, mask, pad_ratio=0.10)
+    # trabajar grande para segmentación
+    img = cv2.resize(img, (512, 512))
+
+    # --- 2) contraste local (CLAHE) en V y en Gray ---
+    lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
+    l, a, b = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+    l = clahe.apply(l)
+    img_clahe = cv2.cvtColor(cv2.merge([l,a,b]), cv2.COLOR_LAB2BGR)
+
+    gray = cv2.cvtColor(img_clahe, cv2.COLOR_BGR2GRAY)
+    hsv  = cv2.cvtColor(img_clahe, cv2.COLOR_BGR2HSV)
+    V    = hsv[...,2]
+    S    = hsv[...,1]
+
+    # --- 3) umbrales complementarios ---
+    # Otsu sobre gris (suave, separa objeto oscuro)
+    _ , m_otsu = cv2.threshold(cv2.GaussianBlur(gray,(5,5),0), 0, 255,
+                               cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+
+    # Adaptativo sobre V (robusto a gradientes de iluminación)
+    m_adap = cv2.adaptiveThreshold(cv2.GaussianBlur(V,(5,5),0), 255,
+                                   cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                   cv2.THRESH_BINARY_INV, 31, 5)
+
+    # Filtro de baja saturación (metales ≈ gris). Ajustable: 0–255
+    m_lowS = (S < 95).astype(np.uint8) * 255
+
+    # Combinar: (Otsu ∪ Adaptativo) ∩ BajaSaturación
+    m = cv2.bitwise_or(m_otsu, m_adap)
+    m = cv2.bitwise_and(m, m_lowS)
+
+    # --- 4) morfología y limpieza de ruido ---
+    m = cv2.morphologyEx(m, cv2.MORPH_OPEN,  np.ones((3,3), np.uint8), 1)
+    m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, np.ones((5,5), np.uint8), 2)
+
+    # quitar componentes muy chicos (<= 0.1% del frame)
+    num, labels, stats, _ = cv2.connectedComponentsWithStats(m, connectivity=8)
+    if num > 1:
+        areas = stats[1:, cv2.CC_STAT_AREA]
+        keep = np.where(areas > 0.001 * m.size)[0] + 1
+        m2 = np.zeros_like(m)
+        for k in keep: m2[labels == k] = 255
+        if m2.any(): m = m2
+
+    # --- 5) recorte al contorno mayor (con un pequeño padding) ---
+    crop, c = _largest_contour_crop(img_clahe, m, pad_ratio=0.10)
     if c is None:
-        crop = img
+        crop = img_clahe
+    crop  = cv2.resize(crop, (256, 256))
+    mask2 = _make_mask_hsv(crop)  # rehago máscara fina sobre el recorte
 
-    crop = cv2.resize(crop, (256,256))
-    # contraste y resegmentación
-    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-    gray = cv2.convertScaleAbs(gray, alpha=1.4, beta=20)
-    gray = cv2.equalizeHist(gray)
-    mask2 = _make_mask_hsv(crop)
-    if mask2.mean() < 10:
-        crop  = _auto_gamma(crop, target_mean=0.7)
-        mask2 = _make_mask_hsv(crop)
+    # sanity check: si quedó muy poca máscara, usa 'm' recortada en vez de mask2
+    if mask2.mean() < 5:
+        # recortar 'm' al mismo ROI usado en _largest_contour_crop
+        # reconstruimos caja aprox desde contorno mayor
+        cnts,_ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if cnts:
+            cmax = max(cnts, key=cv2.contourArea)
+            x,y,w,h = cv2.boundingRect(cmax)
+            roi = img[y:y+h, x:x+w]
+            roi = cv2.resize(roi, (256,256))
+            crop = roi
+            mask2 = _make_mask_hsv(crop)
 
-    # Hu con máscara
-    m  = cv2.moments(mask2)
-    hu = cv2.HuMoments(m).flatten()
-    hu = -np.sign(hu)*np.log10(np.abs(hu)+1e-12)
+    # --- 6) features ---
+    gray256 = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+    gray256 = cv2.convertScaleAbs(gray256, alpha=1.3, beta=15)
+    gray256 = cv2.equalizeHist(gray256)
+
+    # Hu (con máscara)
+    m3 = cv2.moments(mask2)
+    hu = cv2.HuMoments(m3).flatten()
+    hu = -np.sign(hu) * np.log10(np.abs(hu) + 1e-12)
 
     # LBP
-    lbp = local_binary_pattern(gray, 8, 1, method="uniform")
+    lbp = local_binary_pattern(gray256, 8, 1, method="uniform")
     n_bins = 10
-    lbp_hist,_ = np.histogram(lbp.ravel(), bins=n_bins, range=(0,n_bins), density=True)
+    lbp_hist, _ = np.histogram(lbp.ravel(), bins=n_bins, range=(0, n_bins), density=True)
 
-    # HSV (solo objeto si hay área suficiente)
-    hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
-    mask_bool = (mask2>0).astype(np.uint8)
-    if mask_bool.sum() > 100:
-        hist = cv2.calcHist([hsv],[0,1,2], mask_bool, (8,8,8), [0,180,0,256,0,256])
+    # HSV dentro de máscara (si hay área)
+    hsv256 = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+    mbool  = (mask2 > 0).astype(np.uint8)
+    if mbool.sum() > 100:
+        hist = cv2.calcHist([hsv256], [0,1,2], mbool, (8,8,8), [0,180,0,256,0,256])
     else:
-        hist = cv2.calcHist([hsv],[0,1,2], None,       (8,8,8), [0,180,0,256,0,256])
+        hist = cv2.calcHist([hsv256], [0,1,2], None,  (8,8,8), [0,180,0,256,0,256])
     hsv_hist = cv2.normalize(hist, hist).flatten()
 
-    return np.hstack([hu, lbp_hist, hsv_hist]).astype(np.float32)
+    feat = np.hstack([hu, lbp_hist, hsv_hist]).astype(np.float32)
+    return feat
+
 
 # ================== KMeans helpers ==============================
 def _label_from_cluster(clus, cluster_to_class, class_names):

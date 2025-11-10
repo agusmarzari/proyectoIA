@@ -1,214 +1,255 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-K-Means mejorado para agrupar imágenes mezcladas en 4 clusters.
-
-Mejoras clave:
-- Features combinadas: Forma (Hu), Textura (LBP), Color (HSV).
-- Normalización con StandardScaler.
-- Opción de PCA (dimensión reducida para compactar/ruido).
-- KMeans con k-means++ y varios reinicios (n_init).
-- Salida: carpetas por cluster + CSV con asignaciones.
-- (Opcional) Inicialización semi-supervisada con prototipos por clase.
-
-Uso básico (sin prototipos):
-    1) Coloca tus imágenes en "dataset_mix/".
-    2) Ejecuta:
-        python kmeans_mejorado.py
-    3) Mira resultados en "out_clusters_mejorado/" y "cluster_assignments.csv".
-
-Uso opcional con prototipos (si quieres forzar mejor separación):
-    1) Crea "protos/" con subcarpetas por clase y 1-3 imágenes representativas:
-        protos/
-          tornillos/
-          tuercas/
-          arandelas/
-          clavos/
-    2) Activa USE_PROTOTYPES = True abajo.
-    3) Ejecuta el script. Tomará esos prototipos como centros iniciales.
-Requisitos:
-    pip install opencv-python scikit-image scikit-learn numpy joblib pandas
+K-Means mejorado para piezas (tuercas, tornillos, arandelas, clavos)
+- Lee imágenes de dataset_mix/
+- Extrae features (Hu + LBP + HSV) sobre máscara binaria (fondo claro)
+- Escala con StandardScaler, (opcional) PCA
+- Entrena KMeans (k=4), exporta asignaciones a out_clusters_mejorado/cluster_*
+- Guarda bundle para inferencia: kmeans_bundle.joblib  (scaler, pca, kmeans)
+- Guarda mapping cluster->nombre de carpeta: cluster_to_class.json
 """
-import os, glob, shutil, csv
+
+import os, glob, csv, re, json, shutil
 import numpy as np
 import cv2
-import pandas as pd
-from skimage.feature import local_binary_pattern
 from sklearn.cluster import KMeans
 from sklearn.preprocessing import StandardScaler
-from sklearn.decomposition import PCA
+# Si querés usar PCA, destapá las dos líneas marcadas con "PCA"
+# from sklearn.decomposition import PCA
 
-# -----------------------
-# CONFIG
-# -----------------------
-INPUT_DIR = "dataset_mix"                  # carpeta mezclada
-OUTPUT_DIR = "out_clusters_mejorado"       # salida
-CSV_OUT = "cluster_assignments.csv"
-K = 4
-SEED = 42
-N_INIT = 20                                # más robusto que 'auto' para datasets chicos
-USE_PCA = False
-PCA_DIM = 10                               # compresión (ajústalo si quieres)
-# Prototipos (opcional)
-USE_PROTOTYPES = False
-PROTOS_DIR = "protos"
-PROTO_CLASSES = ["tornillos", "tuercas", "arandelas", "clavos"]
+from skimage.feature import local_binary_pattern
 
-# LBP
-LBP_P, LBP_R = 8, 1
-LBP_METHOD = "uniform"                     # hist bins = P + 2
-# HSV hist
-HSV_BINS = (8, 8, 8)                       # 512 dims
+# ---------------- Config ----------------
+DATASET_DIR = "dataset_mix"
+OUT_DIR     = "out_clusters_mejorado"
+ASSIGN_CSV  = "cluster_assignments.csv"
+BUNDLE_OUT  = "kmeans_bundle.joblib"
+MAPJSON     = "cluster_to_class.json"
+IMG_SIZE    = (256, 256)
 
-# -----------------------
-# Utilidades
-# -----------------------
-def ensure_dirs(base: str, k: int):
-    os.makedirs(base, exist_ok=True)
-    for i in range(k):
-        os.makedirs(os.path.join(base, f"cluster_{i}"), exist_ok=True)
+# LBP (uniform)
+LBP_P = 8
+LBP_R = 1
+LBP_METHOD = "uniform"
 
-def list_images(folder: str):
-    exts = ("*.jpg", "*.jpeg", "*.png", "*.bmp", "*.tif", "*.tiff", "*.webp")
-    paths = []
-    for e in exts:
-        paths.extend(glob.glob(os.path.join(folder, e)))
-    return sorted(paths)
+# HSV hist bins por canal
+HSV_BINS = 16  # 16x3 = 48 dims
 
+# KMeans
+N_CLUSTERS = 4
+N_INIT     = 20
+RSTATE     = 42
+# ----------------------------------------
+
+
+# --------------- Feature helpers ----------------
 def preprocess_mask(gray):
-    # Mejorar contraste y resaltar figura principal
-    gray = cv2.equalizeHist(gray)
-    blur = cv2.GaussianBlur(gray, (5,5), 0)
-    bw = cv2.adaptiveThreshold(
-        blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY_INV, 31, 5
-    )
-    return bw
+    """Fondo claro: genera máscara binaria del objeto, preservando agujeros internos
+    (tuercas / arandelas)."""
+    # 1) Normalizar contraste + suavizar
+    gray_eq = cv2.equalizeHist(gray)
+    blur = cv2.GaussianBlur(gray_eq, (5, 5), 0)
+
+    # 2) Umbral inverso (objeto más oscuro/medio sobre fondo claro)
+    #    -> output en {0,1} para operar como máscara lógica
+    _, th = cv2.threshold(blur, 0, 1, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    th = th.astype(np.uint8)
+
+    # 3) Morfología suave: abrir para quitar puntitos.
+    #    (Evitar cierre fuerte que taparía el agujero de la tuerca)
+    th = cv2.morphologyEx(th, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8), iterations=1)
+
+    # 4) Encontrar contornos preservando jerarquía (externos e internos)
+    cnts, hier = cv2.findContours(th, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
+
+    # Si no hay contornos, devolver tal cual
+    if hier is None or len(cnts) == 0:
+        return th
+
+    hier = hier[0]  # jerarquía: [Next, Prev, FirstChild, Parent]
+    mask = np.zeros_like(th, dtype=np.uint8)
+
+    # 5) Rellenar contornos externos con 1 y "recortar" los internos con 0
+    #    (así los agujeros quedan negros dentro del objeto blanco)
+    for i, cnt in enumerate(cnts):
+        parent = hier[i][3]
+        if parent == -1:
+            # contorno externo
+            cv2.drawContours(mask, [cnt], -1, 1, thickness=-1)
+        else:
+            # agujero interno
+            cv2.drawContours(mask, [cnt], -1, 0, thickness=-1)
+
+    # 6) (Opcional) un cierre MUY suave solo para bordes dentados, sin tapar agujeros finos
+    #    Si ves que deja “dientes” en el borde, podés activar esta línea:
+    # mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((3,3), np.uint8), iterations=1)
+
+    return mask
+
 
 def hu_moments_from_mask(mask):
-    m = cv2.moments(mask)
+    m = cv2.moments(mask.astype(np.uint8))
     hu = cv2.HuMoments(m).flatten()
-    # estabilizar escala log
+    # log transform para estabilizar
     hu = -np.sign(hu) * np.log10(np.abs(hu) + 1e-12)
-    return hu  # 7 dims
+    return hu.astype(np.float32)
 
-def lbp_hist(gray, P=LBP_P, R=LBP_R):
-    lbp = local_binary_pattern(gray, P, R, method=LBP_METHOD)
-    n_bins = P + 2  # "uniform"
+
+def lbp_hist(gray):
+    lbp = local_binary_pattern(gray, P=LBP_P, R=LBP_R, method=LBP_METHOD)
+    n_bins = LBP_P + 2  # uniform
     hist, _ = np.histogram(lbp.ravel(), bins=n_bins, range=(0, n_bins), density=True)
-    return hist  # ~10 dims
+    return hist.astype(np.float32)
 
-def hsv_hist(img_bgr, bins=HSV_BINS):
-    hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
-    hist = cv2.calcHist([hsv],[0,1,2],None,bins,[0,180,0,256,0,256])
-    hist = cv2.normalize(hist, hist).flatten()
-    return hist  # 512 dims
 
-def extract_features(img_path):
+def hsv_hist(bgr):
+    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+    hs = []
+    for ch in range(3):
+        hist = cv2.calcHist([hsv],[ch],None,[HSV_BINS],[0, 256])
+        hist = hist.flatten().astype(np.float32)
+        hist = hist / (hist.sum() + 1e-12)
+        hs.append(hist)
+    return np.hstack(hs).astype(np.float32)
+
+
+def extract_features_img(img_path):
     img = cv2.imread(img_path)
     if img is None:
-        raise ValueError(f"No se pudo leer {img_path}")
-    img = cv2.resize(img, (256,256))
+        raise ValueError(f"No puedo leer: {img_path}")
+    img = cv2.resize(img, IMG_SIZE)
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-
     mask = preprocess_mask(gray)
-    hu = hu_moments_from_mask(mask)    # 7
-    lbp = lbp_hist(gray)               # ~10
-    hsv = hsv_hist(img)                # 512
-    return np.hstack([hu, lbp, hsv])   # total ~529
 
-def extract_matrix(paths):
-    X, ok_paths = [], []
-    for p in paths:
-        try:
-            feat = extract_features(p)
-            X.append(feat)
-            ok_paths.append(p)
-        except Exception as e:
-            print("WARN:", p, e)
-    if len(X) == 0:
-        raise SystemExit("No se pudieron extraer features de ninguna imagen.")
-    return np.array(X), ok_paths
+    hu  = hu_moments_from_mask(mask)          # 7
+    lbp = lbp_hist(gray)                      # 10 (uniform con P=8)
+    hsv = hsv_hist(img)                       # 48 (16*3)
+    feat = np.hstack([hu, lbp, hsv]).astype(np.float32)  # total 65 dims
+    return feat, mask
+# -------------------------------------------------
 
-def compute_prototype_centers(scaler, pca=None):
-    """Devuelve centros iniciales a partir de imágenes prototipo por clase."""
-    centers = []
-    for cname in PROTO_CLASSES:
-        folder = os.path.join(PROTOS_DIR, cname)
-        imgs = list_images(folder)
-        if len(imgs) == 0:
-            raise SystemExit(f"Faltan prototipos en {folder}")
-        feats, _ = extract_matrix(imgs)
-        feats = scaler.transform(feats)
-        if pca is not None:
-            feats = pca.transform(feats)
-        center = feats.mean(axis=0)
-        centers.append(center)
-    return np.vstack(centers)
 
-# -----------------------
-# Main
-# -----------------------
+def load_dataset_images():
+    exts = ("*.jpg","*.jpeg","*.png","*.bmp","*.tif","*.tiff","*.webp","*.JPG","*.JPEG","*.PNG")
+    seen = set()
+    files = []
+    base = os.path.abspath(DATASET_DIR)
+    for e in exts:
+        for fp in glob.glob(os.path.join(base, e)):
+            # clave única por ruta absoluta normalizada (insensible a mayúsculas en Windows)
+            key = os.path.normcase(os.path.abspath(fp))
+            if key in seen:
+                continue
+            seen.add(key)
+            files.append(fp)
+    return sorted(files)
+
+
+
 def main():
-    # 1) Leer imágenes
-    paths = list_images(INPUT_DIR)
-    if len(paths) == 0:
-        raise SystemExit("No se encontraron imágenes en dataset_mix/. Coloca tus imágenes y vuelve a ejecutar.")
-    print(f"Imágenes encontradas: {len(paths)}")
+    files = load_dataset_images()
+    print(f"Imágenes encontradas: {len(files)}")
+    feats, good_files, masks = [], [], {}
 
-    # 2) Extraer features
-    X, ok_paths = extract_matrix(paths)
-    print(f"Imágenes válidas: {len(ok_paths)}  |  Dim feats: {X.shape[1]}")
+    for fp in files:
+        try:
+            f, m = extract_features_img(fp)
+            feats.append(f)
+            good_files.append(fp)
+            # guardo máscaras por si querés revisar
+            base = os.path.splitext(os.path.basename(fp))[0]
+            masks[fp] = (m*255).astype("uint8")
+        except Exception as e:
+            print(f"[AVISO] Salteo {fp}: {e}")
 
-    # 3) Escalar
+    if not feats:
+        raise SystemExit("No hay imágenes válidas en dataset_mix/")
+
+    X = np.vstack(feats)
+    print(f"Imágenes válidas: {X.shape[0]}  |  Dim feats: {X.shape[1]}")
+
+    # ========== Escalado (y PCA opcional) ==========
     scaler = StandardScaler()
-    Xs = scaler.fit_transform(X)
+    X_scaled = scaler.fit_transform(X)
 
-    # 4) PCA opcional
-    if USE_PCA:
-        pca = PCA(n_components=min(PCA_DIM, Xs.shape[1]), random_state=SEED)
-        Xf = pca.fit_transform(Xs)
-        print(f"PCA activado → nueva dimensión: {Xf.shape[1]}")
-    else:
-        pca = None
-        Xf = Xs
+    # Si querés PCA, destapá este bloque:
+    # pca = PCA(n_components=min(50, X_scaled.shape[1]))
+    # X_model = pca.fit_transform(X_scaled)
+    pca = None
+    X_model = X_scaled
+    # ===============================================
 
-    # 5) K-Means (con o sin prototipos)
-    if USE_PROTOTYPES:
-        # Centros a partir de protos por clase
-        init_centers = compute_prototype_centers(scaler, pca)
-        if init_centers.shape[0] != K:
-            raise SystemExit("La cantidad de prototipos no coincide con K.")
-        print("Inicializando KMeans con centros de prototipos…")
-        kmeans = KMeans(n_clusters=K, init=init_centers, n_init=1, random_state=SEED)
-    else:
-        print(f"Inicializando KMeans k-means++ | n_init={N_INIT}…")
-        kmeans = KMeans(n_clusters=K, init="k-means++", n_init=N_INIT, random_state=SEED)
+    print(f"Inicializando KMeans k-means++ | n_init={N_INIT}")
+    kmeans = KMeans(n_clusters=N_CLUSTERS, n_init=N_INIT, random_state=RSTATE)
+    kmeans.fit(X_model)
+    labels = kmeans.labels_.astype(int)
 
-    labels = kmeans.fit_predict(Xf)
+    # ---- volcar clusters a carpetas ----
+    if os.path.isdir(OUT_DIR):
+        shutil.rmtree(OUT_DIR)
+    os.makedirs(OUT_DIR, exist_ok=True)
 
-    # 6) Exportar resultados: carpetas + CSV
-    ensure_dirs(OUTPUT_DIR, K)
-    counts = {i: 0 for i in range(K)}
-    rows = []
-    for p, lab in zip(ok_paths, labels):
-        dst = os.path.join(OUTPUT_DIR, f"cluster_{int(lab)}", os.path.basename(p))
-        shutil.copy2(p, dst)
-        counts[int(lab)] += 1
-        rows.append({"filename": os.path.basename(p), "path": p, "cluster": int(lab)})
+    for i, fp in enumerate(good_files):
+        lab = int(labels[i])
+        outc = os.path.join(OUT_DIR, f"cluster_{lab}")
+        os.makedirs(outc, exist_ok=True)
+        dst = os.path.join(outc, os.path.basename(fp))
+        if os.path.abspath(fp) != os.path.abspath(dst):
+            shutil.copy2(fp, dst)
+        # máscara debug opcional por si querés verla
+        # cv2.imwrite(os.path.join(outc, f"mask_{os.path.basename(fp)}.png"), masks[fp])
 
-    with open(CSV_OUT, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=["filename","path","cluster"])
-        writer.writeheader()
-        writer.writerows(rows)
+    # ---- CSV de asignaciones ----
+    with open(ASSIGN_CSV, "w", newline="", encoding="utf-8") as f:
+        wr = csv.writer(f)
+        wr.writerow(["filename", "cluster"])
+        for i, fp in enumerate(good_files):
+            wr.writerow([os.path.basename(fp), int(labels[i])])
 
+    # ---- resumen ----
+    counts = {f"cluster_{k}": int(np.sum(labels==k)) for k in range(N_CLUSTERS)}
     print("\nDistribución por cluster:")
-    for i in range(K):
-        print(f"  cluster_{i}: {counts[i]} imágenes")
+    for name in sorted(counts):
+        print(f"  {name}: {counts[name]} imágenes")
 
-    print(f"\nListo. Revisa: {OUTPUT_DIR}  y  {CSV_OUT}")
-    if USE_PROTOTYPES:
-        print("TIP: puedes ajustar tus prototipos para mejorar separación.")
+    print("\nListo. Revisa: out_clusters_mejorado  y  cluster_assignments.csv")
+
+    # ---------- Guardar bundle ----------
+    try:
+        from joblib import dump
+        bundle = {
+            "scaler": scaler,
+            "pca": pca,          # None si no usaste PCA
+            "kmeans": kmeans,
+            "feature_cfg": {
+                "IMG_SIZE": IMG_SIZE,
+                "LBP_P": LBP_P, "LBP_R": LBP_R, "LBP_METHOD": LBP_METHOD,
+                "HSV_BINS": HSV_BINS
+            }
+        }
+        dump(bundle, BUNDLE_OUT)
+        print(f"\n[OK] Bundle guardado en {BUNDLE_OUT}")
+
+        # mapping cluster -> nombre de carpeta (cluster_0, etc.)
+        mapping = {}
+        if os.path.isdir(OUT_DIR):
+            for name in sorted(os.listdir(OUT_DIR)):
+                p = os.path.join(OUT_DIR, name)
+                if not os.path.isdir(p): 
+                    continue
+                m = re.search(r"(\d+)$", name)  # lee el número final
+                if m:
+                    mapping[int(m.group(1))] = name
+            with open(MAPJSON, "w", encoding="utf-8") as f:
+                json.dump(mapping, f, ensure_ascii=False, indent=2)
+            print(f"[OK] Mapping guardado en {MAPJSON}: {mapping}")
+        else:
+            print("[AVISO] No encontré out_clusters_mejorado; sin mapping.")
+
+    except Exception as e:
+        print("[ERROR] No se pudo generar el bundle:", e)
+
 
 if __name__ == "__main__":
     main()
