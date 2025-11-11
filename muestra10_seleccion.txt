@@ -1,10 +1,10 @@
-dataset_mix\IMG_5944.jpg
-dataset_mix\IMG_5955.jpg
-dataset_mix\IMG_5946.jpg
-dataset_mix\IMG_5947.jpg
-dataset_mix\IMG_5956.jpg
-dataset_mix\IMG_5933.jpg
-dataset_mix\IMG_5929.jpg
-dataset_mix\IMG_5951.jpg
-dataset_mix\IMG_5937.jpg
-dataset_mix\IMG_5962.jpg
+dataset_mix\WhatsApp Image 2025-11-10 at 09.05.46 (1).jpeg
+dataset_mix\WhatsApp Image 2025-11-10 at 09.09.54 (1).jpeg
+dataset_mix\WhatsApp Image 2025-11-10 at 09.09.56 (6).jpeg
+dataset_mix\WhatsApp Image 2025-11-10 at 09.05.45 (1).jpeg
+dataset_mix\WhatsApp Image 2025-11-10 at 09.05.46 (2).jpeg
+dataset_mix\WhatsApp Image 2025-11-10 at 09.09.56 (7).jpeg
+dataset_mix\WhatsApp Image 2025-11-10 at 09.05.46.jpeg
+dataset_mix\WhatsApp Image 2025-11-10 at 09.09.54 (4).jpeg
+dataset_mix\WhatsApp Image 2025-11-10 at 09.05.46 (3).jpeg
+dataset_mix\WhatsApp Image 2025-11-10 at 09.05.46 (4).jpeg

@@ -24,7 +24,8 @@ from skimage.feature import local_binary_pattern
 DATASET_DIR = "dataset_mix"
 BUNDLE_PATH = "kmeans_bundle.joblib"
 MAPJSON     = "cluster_to_class.json"
-VOICE_MODEL = "knn_voice.joblib"   # usado por voice_knn.demo si está disponible
+VOICE_MODEL = "knn_voice.joblib"   # el modelo que entrenaste con tu script original
+
 
 # Orden canónico que espera Bayes:
 CLASS_ORDER = ["tornillos", "clavos", "arandelas", "tuercas"]
@@ -178,53 +179,57 @@ def run_bayes(counts_by_name):
     caja = cajas[caja_idx] if caja_idx < len(cajas) else f"idx_{caja_idx}"
     return vec, posterior, exp_prop, caja
 
+def crop_to_max_energy(y, sr, win_sec=1.2, hop_sec=0.05):
+    import numpy as np
+    win = int(win_sec * sr)
+    hop = int(hop_sec * sr)
+    if len(y) <= win: 
+        return y
+    # energía RMS por ventana deslizante
+    best_s, best_e, best_rms = 0, win, -1.0
+    for s in range(0, len(y)-win+1, hop):
+        e = s + win
+        rms = float(np.sqrt(np.mean(y[s:e]**2)))
+        if rms > best_rms:
+            best_rms, best_s, best_e = rms, s, e
+    return y[best_s:best_e]
 
-def listen_command(seconds=1.8, rate=16000, n_mfcc=13):
+
+def listen_command(seconds=1.8, rate=16000):
     """
-    Siempre devuelve el comando más cercano según KNN (sin umbrales ni fallback).
-    - Graba 'seconds' segundos a 'rate' Hz (mono)
-    - Extrae MFCC (13), promedia en el tiempo
-    - Predice con knn_voice.joblib y devuelve la clase predicha (lowercase)
-    - Muestra distancia al vecino más cercano en el log para diagnóstico
+    Usa TU pipeline original de voz:
+    - voice_knn.demo(modelo, seconds, rate)
+    - Siempre devuelve la clase predicha por tu KNN entrenado.
     """
-    # Cargar modelo KNN
-    from joblib import load as joblib_load
-    import sounddevice as sd, librosa
+    import os
+    import PySimpleGUI as sg
+    try:
+        import voice_knn  # <- tu archivo voice_knn.py
+    except Exception as e:
+        sg.popup_error(f"No pude importar voice_knn.py: {e}")
+        return None
 
     if not os.path.exists(VOICE_MODEL):
         sg.popup_error(f"No encuentro el modelo de voz: {VOICE_MODEL}")
         return None
-    model = joblib_load(VOICE_MODEL)
 
-    # Grabar audio
+    # Ventanita de “Grabando…”
+    sg.popup_quick_message(
+        "🎙️ Grabando...",
+        auto_close=True,
+        auto_close_duration=seconds,
+        no_titlebar=True,
+        keep_on_top=True
+    )
+
     try:
-        sg.popup_quick_message("🎙️ Grabando...", auto_close=True, auto_close_duration=1, no_titlebar=True)
-        rec = sd.rec(int(seconds * rate), samplerate=rate, channels=1, dtype='float32')
-        sd.wait()
-        y = rec.flatten()
-    except Exception:
-        # Si falla la captura de audio, devolvemos algo por defecto para no cortar el flujo
-        return "contar"  # o "proporcion", elegí tu default preferido
+        pred = voice_knn.demo(VOICE_MODEL, seconds=seconds, rate=rate)
+        # Normalizamos a minúsculas por las dudas
+        return (pred or "").strip().lower()
+    except Exception as e:
+        sg.popup_error(f"Error al ejecutar demo() de voice_knn: {e}")
+        return None
 
-    # Extraer features (idéntico al entrenamiento)
-    try:
-        mfcc = librosa.feature.mfcc(y=y, sr=rate, n_mfcc=n_mfcc)
-        feat = np.mean(mfcc, axis=1).reshape(1, -1)
-    except Exception:
-        # Si no podemos extraer MFCC, devolvemos un default
-        return "contar"
-
-    # Predicción SIEMPRE ACEPTADA
-    pred = model.predict(feat)[0]
-    # Distancia del vecino más cercano (solo para que la veas en el log)
-    try:
-        dists, _ = model.kneighbors(feat, n_neighbors=1)
-        d0 = float(dists[0][0])
-        print(f"[voz] Pred: {pred} | dist={d0:.3f}")
-    except Exception:
-        pass
-
-    return str(pred).strip().lower()
 
 
 
